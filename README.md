@@ -6,4 +6,6 @@
 ```
 
 ## 編集後のスコア
-
+```json
+{"pass":true,"score":3161,"success":2942,"fail":0,"messages":[]}
+```
