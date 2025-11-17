@@ -7,10 +7,15 @@ use DI\Container;
 
 require 'vendor/autoload.php';
 
+// 静的ファイル配信
 $_SERVER += ['PATH_INFO' => $_SERVER['REQUEST_URI']];
 $_SERVER['SCRIPT_NAME'] = '/' . basename($_SERVER['SCRIPT_FILENAME']);
 $file = dirname(__DIR__) . '/public' . $_SERVER['REQUEST_URI'];
+
+
+// PHP の簡易 Web サーバ（php -S）で静的ファイルを返すためのコード
 if (is_file($file)) {
+    // 組み込みサーバ（php -S）なら false を返して処理をやめる
     if (PHP_SAPI == 'cli-server') return false;
     $mimetype = [
         'js' => 'application/javascript',
@@ -23,10 +28,12 @@ if (is_file($file)) {
     }
 }
 
+// 定数
 const POSTS_PER_PAGE = 20;
 const UPLOAD_LIMIT = 10 * 1024 * 1024;
 
-// memcached session
+
+// セッション設定（Memcached） 
 $memd_addr = '127.0.0.1:11211';
 if (isset($_SERVER['ISUCONP_MEMCACHED_ADDRESS'])) {
     $memd_addr = $_SERVER['ISUCONP_MEMCACHED_ADDRESS'];
@@ -36,8 +43,11 @@ ini_set('session.save_path', $memd_addr);
 
 session_start();
 
-// dependency
+
+// DIコンテナ設定
 $container = new Container();
+
+// アプリ全体の設定を登録
 $container->set('settings', function() {
     return [
         'public_folder' => dirname(dirname(__FILE__)) . '/public',
@@ -50,6 +60,8 @@ $container->set('settings', function() {
         ],
     ];
 });
+
+// PDO を生成して返す（DB 接続情報は設定から取得）
 $container->set('db', function ($c) {
     $config = $c->get('settings');
     return new PDO(
@@ -59,6 +71,8 @@ $container->set('db', function ($c) {
     );
 });
 
+
+// Slim のビューエンジン (PhpRenderer) を拡張している
 $container->set('view', function ($c) {
     return new class(__DIR__ . '/views/') extends \Slim\Views\PhpRenderer {
         public function render(\Psr\Http\Message\ResponseInterface $response, string $template, array $data = []): ResponseInterface {
@@ -68,10 +82,13 @@ $container->set('view', function ($c) {
     };
 });
 
+// Flash メッセージ（セッション使う一時メッセージ）
 $container->set('flash', function () {
     return new \Slim\Flash\Messages;
 });
 
+
+// アプリ全体で使う便利関数をまとめたヘルパークラス
 $container->set('helper', function ($c) {
     return new class($c) {
         public PDO $db;
@@ -125,46 +142,151 @@ $container->set('helper', function ($c) {
             }
         }
 
+        private function fetch_users_map(array $user_ids) {
+            if (empty($user_ids)) {
+                return [];
+            }
+
+            $user_ids = array_values($user_ids); // キーをリセット
+            $placeholders = implode(',', array_fill(0, count($user_ids), '?'));
+            $query = "SELECT * FROM users WHERE id IN ({$placeholders})";
+
+            $ps = $this->db()->prepare($query);
+            $ps->execute($user_ids);
+            $users = $ps->fetchAll(PDO::FETCH_ASSOC);
+
+            $users_map = [];
+            foreach ($users as $user) {
+                $users_map[$user['id']] = $user;
+            }
+
+            return $users_map;
+        }
+
+        private function fetch_comment_counts(array $post_ids) {
+            if (empty($post_ids)) {
+                return [];
+            }
+
+            $post_ids = array_values($post_ids); // キーをリセット
+            $placeholders = implode(',', array_fill(0, count($post_ids), '?'));
+            $query = "SELECT post_id, COUNT(*) as count FROM comments WHERE post_id IN ({$placeholders}) GROUP BY post_id";
+
+            $ps = $this->db()->prepare($query);
+            $ps->execute($post_ids);
+            $counts = $ps->fetchAll(PDO::FETCH_ASSOC);
+
+            $counts_map = [];
+            foreach ($counts as $row) {
+                $counts_map[$row['post_id']] = (int)$row['count'];
+            }
+
+            return $counts_map;
+        }
+
+        private function fetch_comments_map(array $post_ids, $all_comments = false) {
+            if (empty($post_ids)) {
+                return [];
+            }
+
+            $post_ids = array_values($post_ids); // キーをリセット
+            $placeholders = implode(',', array_fill(0, count($post_ids), '?'));
+            $query = "SELECT * FROM comments WHERE post_id IN ({$placeholders}) ORDER BY created_at DESC";
+
+            $ps = $this->db()->prepare($query);
+            $ps->execute($post_ids);
+            $comments = $ps->fetchAll(PDO::FETCH_ASSOC);
+
+            // post_idごとにグループ化
+            $comments_map = [];
+            foreach ($comments as $comment) {
+                $comments_map[$comment['post_id']][] = $comment;
+            }
+
+            // 各投稿のコメントを処理
+            if (!$all_comments) {
+                // 最新3件を取得して、古い順に並べる
+                foreach ($comments_map as $post_id => &$post_comments) {
+                    $post_comments = array_reverse(array_slice($post_comments, 0, 3));
+                }
+                unset($post_comments);
+            } else {
+                // 全コメントを古い順に並べる
+                foreach ($comments_map as $post_id => &$post_comments) {
+                    $post_comments = array_reverse($post_comments);
+                }
+                unset($post_comments);
+            }
+
+            return $comments_map;
+        }
+
         public function make_posts(array $results, $options = []) {
             $options += ['all_comments' => false];
             $all_comments = $options['all_comments'];
 
+            if (empty($results)) {
+                return [];
+            }
+
+            // ステップ1: 必要なIDを収集
+            $post_ids = array_column($results, 'id');
+            $user_ids = array_unique(array_column($results, 'user_id'));
+
+            // ステップ2: ユーザー情報を一括取得
+            $users_map = $this->fetch_users_map($user_ids);
+
+            // ステップ3: コメント数を一括取得
+            $comment_counts = $this->fetch_comment_counts($post_ids);
+
+            // ステップ4: コメントを一括取得
+            $comments_map = $this->fetch_comments_map($post_ids, $all_comments);
+
+            // ステップ5: コメントのユーザーIDを収集して一括取得
+            $comment_user_ids = [];
+            foreach ($comments_map as $comments) {
+                foreach ($comments as $comment) {
+                    $comment_user_ids[] = $comment['user_id'];
+                }
+            }
+            $comment_users_map = $this->fetch_users_map(array_unique($comment_user_ids));
+
+            // ステップ6: データを組み立て
             $posts = [];
             foreach ($results as $post) {
-                $post['comment_count'] = $this->fetch_first('SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?', $post['id'])['count'];
-                $query = 'SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC';
-                if (!$all_comments) {
-                    $query .= ' LIMIT 3';
-                }
+                $post['comment_count'] = $comment_counts[$post['id']] ?? 0;
 
-                $ps = $this->db()->prepare($query);
-                $ps->execute([$post['id']]);
-                $comments = $ps->fetchAll(PDO::FETCH_ASSOC);
+                $comments = $comments_map[$post['id']] ?? [];
                 foreach ($comments as &$comment) {
-                    $comment['user'] = $this->fetch_first('SELECT * FROM `users` WHERE `id` = ?', $comment['user_id']);
+                    $comment['user'] = $comment_users_map[$comment['user_id']] ?? null;
                 }
                 unset($comment);
-                $post['comments'] = array_reverse($comments);
+                $post['comments'] = $comments;
 
-                $post['user'] = $this->fetch_first('SELECT * FROM `users` WHERE `id` = ?', $post['user_id']);
-                if ($post['user']['del_flg'] == 0) {
+
+                $post['user'] = $users_map[$post['user_id']] ?? null;
+
+                if ($post['user'] && $post['user']['del_flg'] == 0) {  // ← null チェック追加
                     $posts[] = $post;
                 }
+
                 if (count($posts) >= POSTS_PER_PAGE) {
                     break;
                 }
             }
+
             return $posts;
         }
 
     };
 });
 
+// Slim アプリ生成
 AppFactory::setContainer($container);
 $app = AppFactory::create();
 
-// ------- helper method for view
 
+// ヘルパー関数群
 function escape_html($h) {
     return htmlspecialchars($h, ENT_QUOTES | ENT_HTML5, 'UTF-8');
 }
@@ -207,7 +329,7 @@ function calculate_passhash($account_name, $password) {
     return digest("{$password}:{$salt}");
 }
 
-// --------
+// ルーティング設定
 
 $app->get('/initialize', function (Request $request, Response $response) {
     $this->get('helper')->db_initialize();
